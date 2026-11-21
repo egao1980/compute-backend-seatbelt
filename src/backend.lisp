@@ -55,8 +55,37 @@ probe, cached in the backend: SANDBOX-EXEC -p \"(version 1)(allow default)\" --
 /usr/bin/true through PROCESS-PROTOCOL:RUN; exit 0 → T NIL, else NIL and a reason
 starting \"sandbox-exec does not run here\" with the probe's trimmed stderr (e.g. the
 harness itself already sandboxed: sandbox_apply EPERM)."
-  (declare (ignore backend))
-  (%r4d1-pending 'confinement-available-p))
+  (let ((path (seatbelt-backend-sandbox-exec backend)))
+    (cond ((not (uiop:os-macosx-p))
+           (values nil "not macOS"))
+          ((let ((pathname (uiop:parse-native-namestring path)))
+             (or (not (uiop:file-exists-p pathname))
+                 (uiop:directory-exists-p pathname)))
+           ;; Not cached: a stat, and sandbox-exec may appear later.
+           (values nil (format nil "~a: no such executable file" path)))
+          (t
+           ;; Two threads probing at once store equal answers; the last SETF wins.
+           (let ((cached (or (%seatbelt-availability backend)
+                             (setf (%seatbelt-availability backend)
+                                   (%probe-sandbox-exec path)))))
+             (values (car cached) (cdr cached)))))))
+
+(defun %probe-sandbox-exec (path)
+  "Run PATH -p \"(version 1)(allow default)\" -- /usr/bin/true once.
+→ (available-p . reason). A spawn failure (e.g. PATH not executable) is
+process-protocol's PROCESS-ERROR, answered as unavailable with a reason naming PATH."
+  (handler-case
+      (multiple-value-bind (code out err)
+          (pp:run (list path "-p" "(version 1)(allow default)" "--" "/usr/bin/true")
+                  :output :string :error-output :string)
+        (declare (ignore out))
+        (if (eql code 0)
+            (cons t nil)
+            (cons nil (format nil "sandbox-exec does not run here: ~a (~a exited ~a)"
+                              (string-trim '(#\Space #\Tab #\Newline #\Return) (or err ""))
+                              path code))))
+    (pp:process-error (e)
+      (cons nil (format nil "sandbox-exec does not run here: ~a cannot be run: ~a" path e)))))
 
 (defmethod sc:backend-confine-argv ((backend seatbelt-backend) confinement argv directory tmp)
   "→ (values (SEATBELT-ARGV CONFINEMENT (SEATBELT-PROFILE CONFINEMENT TMP) ARGV
@@ -66,5 +95,8 @@ harness itself already sandboxed: sandbox_apply EPERM)."
 CONFINEMENT is resolved and checked by SC:CONFINE-COMMAND; DIRECTORY needs no rule of
 its own (it is readable under the confinement, CONFINE-COMMAND checked it). No
 cleanups: the profile is inline, nothing is written."
-  (declare (ignore backend confinement argv directory tmp))
-  (%r4d1-pending 'backend-confine-argv))
+  (declare (ignore directory))
+  (values (seatbelt-argv confinement (seatbelt-profile confinement tmp) argv
+                         :sandbox-exec (seatbelt-backend-sandbox-exec backend))
+          (list (cons "STACK_COMPUTE_CONFINEMENT" "seatbelt"))
+          nil))

@@ -12,9 +12,6 @@
 ;;; beats every allow), then the network rules. User paths only ever appear as
 ;;; (subpath "…") or (literal "…") string literals — never in a regex.
 
-(defun %r4d1-pending (name)
-  (error "R4d-1 pending: ~a" name))
-
 ;;; Constants
 
 (defparameter +sandbox-exec+ "/usr/bin/sandbox-exec"
@@ -82,14 +79,44 @@ execs whatever /private/var/select/sh names (bash, dash or zsh), and their
   "STRING as an SBPL string literal: wrapped in double quotes, each \\ and \" in it
 preceded by a \\. Nothing else is changed (spaces, parentheses, ;, #, non-ASCII
 characters stay as they are; the profile is passed as UTF-8)."
-  (declare (ignore string))
-  (%r4d1-pending 'sbpl-string))
+  (check-type string string)
+  (with-output-to-string (out)
+    (write-char #\" out)
+    (loop for ch across string
+          do (when (or (char= ch #\\) (char= ch #\"))
+               (write-char #\\ out))
+             (write-char ch out))
+    (write-char #\" out)))
 
 (defun sbpl-path (pathname)
   "PATHNAME's UIOP:UNIX-NAMESTRING without a trailing /, except the root, which stays
 \"/\". Not quoted (SBPL-STRING does that). Same result on every OS."
-  (declare (ignore pathname))
-  (%r4d1-pending 'sbpl-path))
+  (let* ((namestring (uiop:unix-namestring pathname))
+         (length (length namestring)))
+    (if (and (> length 1) (char= #\/ (char namestring (1- length))))
+        (subseq namestring 0 (1- length))
+        namestring)))
+
+(defun %rule (head filter path)
+  "One SBPL line (HEAD (FILTER \"PATH\")). PATH is a pathname (rendered by
+SBPL-PATH) or a fixed string; either way it goes through SBPL-STRING, so it is
+always a quoted literal."
+  (format nil "(~a (~a ~a))" head filter
+          (sbpl-string (if (stringp path) path (sbpl-path path)))))
+
+(defun %path-filter (pathname)
+  "subpath for a directory pathname (no name, no type), literal for a file."
+  (if (and (null (pathname-name pathname)) (null (pathname-type pathname)))
+      "subpath"
+      "literal"))
+
+(defun %ancestors (rendered)
+  "The proper ancestors of the SBPL-PATH string RENDERED, from the root down, / excluded:
+\"/a/b/c\" → (\"/a\" \"/a/b\"). Files and directories alike, since SBPL-PATH already
+dropped a directory's trailing /: every / after position 0 ends one ancestor."
+  (loop for i from 1 below (length rendered)
+        when (char= #\/ (char rendered i))
+          collect (subseq rendered 0 i)))
 
 (defun seatbelt-profile (confinement tmp &key (system-read-paths (sc:system-read-paths))
                                               (shared-tmp (sc:physical-path
@@ -124,8 +151,57 @@ no type (subpath), anything else is a file (literal). The lines, in order:
    and (allow network-outbound (literal \"/private/var/run/mDNSResponder\")); then
    (allow network-outbound (remote ip \"*:PORT\")) per distinct rule port, in rule
    order (every rule's host is \"*\": CHECK-CONFINEMENT refused host rules)."
-  (declare (ignore confinement tmp system-read-paths shared-tmp))
-  (%r4d1-pending 'seatbelt-profile))
+  (let* ((c confinement)
+         (writes (append (sc:confinement-writable c)
+                         (when tmp (list tmp))
+                         (when (eq (sc:confinement-tmp c) :shared) (list shared-tmp))))
+         (reads (append system-read-paths
+                        (mapcar #'uiop:parse-unix-namestring +seatbelt-extra-read-paths+)
+                        (sc:confinement-readable c)))
+         (lines '()))
+    (flet ((emit (line) (push line lines)))
+      ;; 1. base
+      (dolist (line +seatbelt-base-profile+) (emit line))
+      ;; 2. reads
+      (ecase (sc:confinement-read c)
+        (:all (emit "(allow file-read*)"))
+        (:system
+         (emit "(allow file-read* (literal \"/\"))")
+         (dolist (m +seatbelt-metadata-literals+)
+           (emit (%rule "allow file-read-metadata" "literal" m)))
+         (dolist (p reads)
+           (emit (%rule "allow file-read*" (%path-filter p) p)))
+         (dolist (a (remove-duplicates
+                     (loop for p in (append reads writes)
+                           append (%ancestors (sbpl-path p)))
+                     :test #'string= :from-end t))
+           (emit (%rule "allow file-read-metadata" "literal" a)))))
+      ;; 3. writes (always subpath), then the devices (fixed strings, literal)
+      (dolist (w writes)
+        (emit (%rule "allow file-read* file-write*" "subpath" w)))
+      (dolist (d sc:+device-paths+)
+        (emit (%rule "allow file-read* file-write* file-ioctl" "literal" d)))
+      ;; 4. deny-read, last among the file rules: subpath for files and directories
+      (dolist (p (sc:confinement-deny-read c))
+        (emit (%rule "deny file-read* file-write*" "subpath" p)))
+      ;; 5. network
+      (let ((network (sc:confinement-network c)))
+        (cond ((eq network :none))
+              ((eq network :allow)
+               (emit "(allow network*)")
+               (dolist (s +seatbelt-network-services+)
+                 (emit (%rule "allow mach-lookup" "global-name" s))))
+              (t
+               (when (sc:sandbox-network-policy-dns network)
+                 (emit (%rule "allow mach-lookup" "global-name"
+                              (first +seatbelt-network-services+)))
+                 (emit "(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))"))
+               (dolist (port (remove-duplicates
+                              (mapcar #'sc:egress-rule-port
+                                      (sc:sandbox-network-policy-egress network))
+                              :from-end t))
+                 (emit (format nil "(allow network-outbound (remote ip \"*:~d\"))" port)))))))
+    (format nil "~{~a~%~}" (nreverse lines))))
 
 ;;; argv
 
@@ -139,8 +215,25 @@ ulimit stops the launch (fail closed). KIB is FILE-SIZE-LIMIT bytes divided by
 1024, rounded down (never a larger file than asked). MEMORY-LIMIT and WALL-CLOCK
 never appear (not Seatbelt features; the wall clock is the launcher's). Note: the
 process limit is RLIMIT_NPROC, which macOS counts per user, not per tree."
-  (declare (ignore confinement))
-  (%r4d1-pending 'seatbelt-limit-argv))
+  (let* ((cpu (sc:confinement-cpu-limit confinement))
+         (file-size (sc:confinement-file-size-limit confinement))
+         (processes (sc:confinement-process-limit confinement))
+         (parts (append (when cpu (list (format nil "ulimit -t ~d" cpu)))
+                        (when file-size (list (format nil "ulimit -f ~d" (floor file-size 1024))))
+                        (when processes (list (format nil "ulimit -u ~d" processes))))))
+    (when parts
+      (list +limit-shell+ "-c"
+            (format nil "~{~a~^ && ~} && exec \"$@\"" parts)
+            "stack-compute-limits"))))
+
+(defun %utf-8-length (string)
+  "The number of octets STRING takes in UTF-8."
+  (loop for ch across string
+        for code = (char-code ch)
+        sum (cond ((< code #x80) 1)
+                  ((< code #x800) 2)
+                  ((< code #x10000) 3)
+                  (t 4))))
 
 (defun seatbelt-argv (confinement profile argv &key (sandbox-exec +sandbox-exec+))
   "The argv that runs ARGV under PROFILE:
@@ -149,5 +242,11 @@ The profile goes inline (-p): a temp file (-f) has the same compiled-size limit 
 macOS's ARG_MAX (1 MiB) is never the binding constraint. PROFILE longer than
 +PROFILE-SIZE-LIMIT+ UTF-8 octets → SC:INVALID-CONFINEMENT with field :PROFILE and
 value the octet length (nothing is run or created)."
-  (declare (ignore confinement profile argv sandbox-exec))
-  (%r4d1-pending 'seatbelt-argv))
+  (let ((octets (%utf-8-length profile)))
+    (when (> octets +profile-size-limit+)
+      (error 'sc:invalid-confinement
+             :field :profile :value octets
+             :message (format nil "the Seatbelt profile is ~d UTF-8 octets, more than ~d"
+                              octets +profile-size-limit+)))
+    (list* sandbox-exec "-p" profile "--"
+           (append (seatbelt-limit-argv confinement) argv))))
