@@ -3,7 +3,7 @@
   :description "Confining compute-protocol backend: macOS Seatbelt (sandbox-exec, generated SBPL profile)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "compute-protocol" "0.3.0")
+  :depends-on ((:version "compute-protocol" "0.3.1")
                (:version "process-protocol" "0.4.1")
                (:version "process-backend-uiop" "0.3.1")
                "uiop")
