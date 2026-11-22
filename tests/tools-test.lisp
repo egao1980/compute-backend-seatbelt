@@ -33,6 +33,21 @@
       (ng (eql 0 code))
       (ng (uiop:file-exists-p (sub root "outside/new"))))))
 
+(deftest-macos tools-cat-to-captured-stdio-read-system
+  ;; #2: under READ :SYSTEM a confined cat(1) fstat()s its stdout; that must
+  ;; work on whatever RUN-CONFINED captures stdout / stderr with.
+  (with-temp-tree (root "area/")
+    (let ((c (area-confinement (sub root "area/") :read :system)))
+      (dolist (case '(("echo hi > x.txt; cat x.txt" "hi" "")
+                      ("echo hi | cat" "hi" "")
+                      ("echo hi > x.txt; cat x.txt >&2" "" "hi")
+                      ("echo hi | cat | head -1" "hi" "")))
+        (destructuring-bind (script want-out want-err) case
+          (multiple-value-bind (code out err) (run-in c (sh script))
+            (ok (eql 0 code) (format nil "~a: exit ~a, stderr ~s" script code err))
+            (ok (equal want-out (string-right-trim '(#\Newline) out)) script)
+            (ok (equal want-err (string-right-trim '(#\Newline) err)) script)))))))
+
 (defun %git-works-p ()
   (ignore-errors
    (zerop (nth-value 2 (uiop:run-program '("git" "--version") :ignore-error-status t)))))
